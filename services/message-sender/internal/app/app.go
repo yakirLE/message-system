@@ -1,6 +1,10 @@
 package app
 
-import "context"
+import (
+	"context"
+
+	"github.com/yakirLE/message-system/nats"
+)
 
 type app struct {
 	cfg        config
@@ -8,6 +12,8 @@ type app struct {
 }
 
 func New(cfg config) *app {
+	natsQueue := nats.New(cfg, "message-queue", "message-type-1")
+
 	return nil
 }
 
@@ -21,6 +27,7 @@ func (a app) Stop(ctx context.Context) error {
 
 type config interface {
 	GetString(key string) string
+	GetInt(key string) int
 }
 
 type grpcServer interface {

@@ -10,6 +10,7 @@ import (
 
 	"github.com/yakirLE/message-system/message-sender/internal/app"
 	"github.com/yakirLE/message-system/message-sender/internal/config"
+
 	"go.uber.org/zap"
 )
 

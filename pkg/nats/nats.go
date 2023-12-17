@@ -11,35 +11,35 @@ import (
 type impl struct {
 	conn       *natssdk.Conn
 	jsCtx      natssdk.JetStreamContext
+	cfg        config
 	streamName string
 	subjects   []string
 }
 
-func New(ctx context.Context, cfg config, streamName string, subjects ...string) (*impl, error) {
-	nc, err := connectToNATS(cfg.GetString("nats.url"), cfg.GetInt("nats.port"))
+func New(cfg config, streamName string, subjects ...string) *impl {
+	return &impl{
+		cfg:        cfg,
+		streamName: streamName,
+		subjects:   subjects,
+	}
+}
+
+func (n *impl) Register(ctx context.Context) error {
+	nc, err := connectToNATS(n.cfg.GetString("nats.url"), n.cfg.GetInt("nats.port"))
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	jsCtx, err := createNatsJetStream(nc)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, time.Duration(cfg.GetInt("nats.timeout"))*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(n.cfg.GetInt("nats.timeout"))*time.Second)
 	defer cancel()
 
-	_, err = addStream(ctx, jsCtx, streamName, subjects)
-	if err != nil {
-		return nil, err
-	}
-
-	return &impl{
-		conn:       nc,
-		jsCtx:      jsCtx,
-		streamName: streamName,
-		subjects:   subjects,
-	}, nil
+	_, err = addStream(ctx, jsCtx, n.streamName, n.subjects)
+	return err
 }
 
 func (n *impl) PublishMessage(subject string, payload []byte) error {
