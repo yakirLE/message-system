@@ -6,18 +6,14 @@ import (
 	"time"
 
 	natssdk "github.com/nats-io/nats.go"
-	"github.com/nats-io/nats.go/jetstream"
 )
 
-//go:generate docker run --name nats --rm -p 4222:4222 -p 8222:8222 nats -js --http_port 8222
 type impl struct {
-	conn            *natssdk.Conn
-	js              jetstream.JetStream
-	stream          jetstream.Stream
-	consumeContexts []jetstream.ConsumeContext
-	cfg             config
-	streamName      string
-	subjects        []string
+	conn       *natssdk.Conn
+	jsCtx      natssdk.JetStreamContext
+	cfg        config
+	streamName string
+	subjects   []string
 }
 
 func New(cfg config, streamName string, subjects ...string) *impl {
@@ -34,7 +30,7 @@ func (n *impl) Register(ctx context.Context) error {
 		return err
 	}
 
-	js, err := createNatsJetStream(nc)
+	jsCtx, err := createNatsJetStream(nc)
 	if err != nil {
 		return err
 	}
@@ -42,76 +38,51 @@ func (n *impl) Register(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(n.cfg.GetInt("nats.timeout"))*time.Second)
 	defer cancel()
 
-	stream, err := createOrUpdateStream(ctx, js, n.streamName, n.subjects)
-	if err != nil {
-		return fmt.Errorf("register failed: %w", err)
-	}
-
-	n.js = js
-	n.stream = stream
-
-	return nil
+	_, err = addStream(ctx, jsCtx, n.streamName, n.subjects)
+	return err
 }
 
-func (n *impl) PublishMessage(ctx context.Context, subject string, payload []byte) error {
+func (n *impl) PublishMessage(subject string, payload []byte) error {
 	if !n.isSubjectSupported(subject) {
 		return fmt.Errorf("subject not supported: %s", subject)
 	}
 
-	return publishMessage(ctx, n.js, subject, payload)
+	return publishMessage(n.conn, subject, payload)
 }
 
-func (n *impl) PollMessages(ctx context.Context, subject string, maxMessages int, autoAck bool) ([]jetstream.Msg, error) {
+func (n *impl) PollMessage(ctx context.Context, subject string) (string, string, []byte, error) {
 	if !n.isSubjectSupported(subject) {
-		return nil, fmt.Errorf("subject not supported: %s", subject)
+		return "", "", nil, fmt.Errorf("subject not supported: %s", subject)
 	}
 
-	consumer, err := createOrUpdateConsumer(ctx, n.stream, n.streamName, true)
+	_, err := createEphemeralConsumer(ctx, n.jsCtx, n.streamName)
 	if err != nil {
-		return nil, err
+		return "", "", nil, err
 	}
 
-	msgs := fetchMessages(ctx, consumer, maxMessages, autoAck)
-
-	return msgs, nil
-}
-
-func (n *impl) ConsumeMessages(ctx context.Context, subject string, maxMessages int, autoAck bool, msgHandler func(jetstream.Msg)) error {
-	if !n.isSubjectSupported(subject) {
-		return fmt.Errorf("subject not supported: %s", subject)
-	}
-
-	consumer, err := createOrUpdateConsumer(ctx, n.stream, n.streamName, true)
+	subscriber, err := subscribe(ctx, n.jsCtx, subject, n.streamName)
 	if err != nil {
-		return err
+		return "", "", nil, err
 	}
 
-	cctx, err := consume(ctx, consumer, maxMessages, autoAck, msgHandler)
+	msg, err := fetchOne(ctx, subscriber)
 	if err != nil {
-		return err
+		return "", "", nil, err
 	}
 
-	n.consumeContexts = append(n.consumeContexts, cctx)
-
-	return nil
-}
-
-func (n *impl) Close() {
-	for _, cctx := range n.consumeContexts {
-		cctx.Stop()
-	}
-
-	n.conn.Close()
+	return msg.Subject, msg.Reply, msg.Data, nil
 }
 
 func (n *impl) isSubjectSupported(subject string) bool {
+	var found bool
 	for _, s := range n.subjects {
 		if subject == s {
-			return true
+			found = true
+			break
 		}
 	}
 
-	return false
+	return found
 }
 
 func connectToNATS(url string, port int) (*natssdk.Conn, error) {
@@ -123,32 +94,36 @@ func connectToNATS(url string, port int) (*natssdk.Conn, error) {
 	return nc, nil
 }
 
-func createNatsJetStream(nc *natssdk.Conn) (jetstream.JetStream, error) {
-	js, err := jetstream.New(nc)
+func createNatsJetStream(nc *natssdk.Conn) (natssdk.JetStreamContext, error) {
+	jsCtx, err := nc.JetStream()
 	if err != nil {
 		return nil, fmt.Errorf("jetstream: %w", err)
 	}
 
-	return js, nil
+	return jsCtx, nil
 }
 
-func createOrUpdateStream(ctx context.Context, js jetstream.JetStream, streamName string, subjects []string) (jetstream.Stream, error) {
-	stream, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
-		Name:        streamName,
-		Description: streamName,
-		Subjects:    subjects,
-		MaxBytes:    1024 * 1024 * 1024,
-	})
-
+func addStream(ctx context.Context, jsCtx natssdk.JetStreamContext, streamName string, subjects []string) (*natssdk.StreamInfo, error) {
+	stream, err := jsCtx.AddStream(&natssdk.StreamConfig{
+		Name:              streamName,
+		Subjects:          subjects,
+		Retention:         natssdk.InterestPolicy,
+		Discard:           natssdk.DiscardOld,
+		MaxAge:            7 * 24 * time.Hour,
+		Storage:           natssdk.FileStorage,
+		MaxMsgsPerSubject: 100_000_000,
+		MaxMsgSize:        4 << 20,
+		NoAck:             false,
+	}, natssdk.Context(ctx))
 	if err != nil {
-		return nil, fmt.Errorf("create or update stream: %w", err)
+		return nil, fmt.Errorf("add stream: %w", err)
 	}
 
 	return stream, nil
 }
 
-func publishMessage(ctx context.Context, js jetstream.JetStream, subject string, payload []byte) error {
-	_, err := js.Publish(ctx, subject, payload)
+func publishMessage(nc *natssdk.Conn, subject string, payload []byte) error {
+	err := nc.Publish(subject, payload)
 	if err != nil {
 		return fmt.Errorf("publish: %w", err)
 	}
@@ -156,63 +131,48 @@ func publishMessage(ctx context.Context, js jetstream.JetStream, subject string,
 	return nil
 }
 
-func createOrUpdateConsumer(ctx context.Context, stream jetstream.Stream, streamName string, ephemeral bool) (jetstream.Consumer, error) {
-	var durable string
-	if !ephemeral {
-		durable = streamName
-	}
-
-	consumer, err := stream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
-		Name:          streamName,
-		Durable:       durable,
-		DeliverPolicy: jetstream.DeliverAllPolicy,
-		AckPolicy:     jetstream.AckExplicitPolicy,
+func createEphemeralConsumer(ctx context.Context, jsCtx natssdk.JetStreamContext, streamName string) (*natssdk.ConsumerInfo, error) {
+	consumer, err := jsCtx.AddConsumer(streamName, &natssdk.ConsumerConfig{
+		// Durable:       consumerGroupName,
+		DeliverPolicy: natssdk.DeliverAllPolicy,
+		AckPolicy:     natssdk.AckExplicitPolicy,
 		AckWait:       5 * time.Second,
 		MaxAckPending: -1,
-	})
-
+	}, natssdk.Context(ctx))
 	if err != nil {
-		return nil, fmt.Errorf("create or update consumer: %w", err)
+		return nil, fmt.Errorf("add consumer: %w", err)
 	}
 
 	return consumer, nil
 }
 
-func consume(_ context.Context, consumer jetstream.Consumer, maxMessages int, autoAck bool, msgHandler func(jetstream.Msg)) (jetstream.ConsumeContext, error) {
-	f := msgHandler
-	if autoAck {
-		f = func(msg jetstream.Msg) {
-			msgHandler(msg)
-			msg.Ack()
-		}
-	}
+func subscribe(ctx context.Context, jsCtx natssdk.JetStreamContext, subject, streamName string) (*natssdk.Subscription, error) {
+	pullSub, err := jsCtx.PullSubscribe(
+		subject,
+		"",
+		natssdk.ManualAck(),
+		// natssdk.Bind(streamName, consumerGroupName),
+		natssdk.Context(ctx),
+	)
 
-	cctx, err := consumer.Consume(f, jetstream.PullMaxMessages(maxMessages))
 	if err != nil {
-		return nil, fmt.Errorf("consume error: %w", err)
+		return nil, fmt.Errorf("pull subscribe: %w", err)
 	}
 
-	return cctx, nil
+	return pullSub, nil
 }
 
-func fetchMessages(_ context.Context, consumer jetstream.Consumer, maxMessages int, autoAck bool) []jetstream.Msg {
-	messages := make([]jetstream.Msg, 0, maxMessages)
-	iter, _ := consumer.Messages(jetstream.PullMaxMessages(maxMessages))
-	for i := 0; i < maxMessages; i++ {
-		msg, err := iter.Next()
-		if err != nil {
-			break
-		}
-
-		messages = append(messages, msg)
-		if autoAck {
-			msg.Ack()
-		}
+func fetchOne(ctx context.Context, pullSub *natssdk.Subscription) (*natssdk.Msg, error) {
+	msgs, err := pullSub.Fetch(1, natssdk.Context(ctx))
+	if err != nil {
+		return nil, fmt.Errorf("fetch: %w", err)
 	}
 
-	iter.Stop()
+	if len(msgs) == 0 {
+		return nil, fmt.Errorf("no messages")
+	}
 
-	return messages
+	return msgs[0], nil
 }
 
 type config interface {
